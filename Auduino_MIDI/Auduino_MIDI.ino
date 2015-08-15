@@ -1,3 +1,5 @@
+// Modified by Ryo Ishigaki, https://github.com/risgk
+
 // Auduino, the Lo-Fi granular synthesiser
 //
 // by Peter Knight, Tinker.it http://tinker.it

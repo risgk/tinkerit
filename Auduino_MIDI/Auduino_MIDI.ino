@@ -1,4 +1,4 @@
-// Modified by Ryo Ishigaki, https://github.com/risgk
+// Modified by Ryo Ishigaki, https://github.com/risgk/tinkerit
 
 // Auduino, the Lo-Fi granular synthesiser
 //
@@ -6,12 +6,6 @@
 //
 // Help:      http://code.google.com/p/tinkerit/wiki/Auduino
 // More help: http://groups.google.com/group/auduino
-//
-// Analog in 0: Grain 1 pitch
-// Analog in 1: Grain 2 decay
-// Analog in 2: Grain 1 decay
-// Analog in 3: Grain 2 pitch
-// Analog in 4: Grain repetition frequency
 //
 // Digital 3: Audio out (Digital 11 on ATmega8)
 //
@@ -35,12 +29,181 @@ uint16_t grain2PhaseInc;
 uint16_t grain2Amp;
 uint8_t grain2Decay;
 
-// Map Analogue channels
-#define SYNC_CONTROL         (4)
-#define GRAIN_FREQ_CONTROL   (0)
-#define GRAIN_DECAY_CONTROL  (2)
-#define GRAIN2_FREQ_CONTROL  (3)
-#define GRAIN2_DECAY_CONTROL (1)
+// MIDI
+#define MIDI_CH               (0)
+#define SERIAL_SPEED          (38400)
+
+#define DATA_BYTE_MAX         (0x7F)
+#define STATUS_BYTE_INVALID   (0x7F)
+#define DATA_BYTE_INVALID     (0x80)
+#define STATUS_BYTE_MIN       (0x80)
+#define NOTE_OFF              (0x80)
+#define NOTE_ON               (0x90)
+#define CONTROL_CHANGE        (0xB0)
+#define SYSTEM_MESSAGE_MIN    (0xF0)
+#define SYSTEM_EXCLUSIVE      (0xF0)
+#define TIME_CODE             (0xF1)
+#define SONG_POSITION         (0xF2)
+#define SONG_SELECT           (0xF3)
+#define TUNE_REQUEST          (0xF6)
+#define EOX                   (0xF7)
+#define REAL_TIME_MESSAGE_MIN (0xF8)
+#define ACTIVE_SENSING        (0xFE)
+
+#define GRAIN_FREQ_CONTROL    (16)
+#define GRAIN_DECAY_CONTROL   (17)
+#define GRAIN2_FREQ_CONTROL   (18)
+#define GRAIN2_DECAY_CONTROL  (19)
+#define ALL_NOTES_OFF         (123)
+
+#define INLINE inline __attribute__((always_inline))
+
+class SerialIn {
+public:
+  INLINE static void open() {
+    UBRR0 = (1000000 / SERIAL_SPEED) - 1;
+    UCSR0B = _BV(RXEN0);
+  }
+
+  INLINE static boolean available() {
+    return UCSR0A & _BV(RXC0);
+  }
+
+  INLINE static int8_t read() {
+    return UDR0;
+  }
+};
+
+uint16_t mapPhaseInc(uint16_t input);
+uint16_t mapMidi(uint16_t input);
+
+class MIDI {
+  static uint8_t m_system_exclusive;
+  static uint8_t m_system_data_remaining;
+  static uint8_t m_running_status;
+  static uint8_t m_first_data;
+
+public:
+  INLINE static void initialize() {
+    m_system_exclusive = false;
+    m_system_data_remaining = 0;
+    m_running_status = STATUS_BYTE_INVALID;
+    m_first_data = DATA_BYTE_INVALID;
+  }
+
+  INLINE static void receive_midi_byte(uint8_t b) {
+    if (is_data_byte(b)) {
+      if (m_system_exclusive) {
+        // do nothing
+      } else if (m_system_data_remaining != 0) {
+        m_system_data_remaining--;
+      } else if (m_running_status == (NOTE_ON | MIDI_CH)) {
+        if (!is_data_byte(m_first_data)) {
+          m_first_data = b;
+        } else if (b == 0) {
+          note_off(m_first_data);
+          m_first_data = DATA_BYTE_INVALID;
+        } else {
+          note_on(m_first_data);
+          m_first_data = DATA_BYTE_INVALID;
+        }
+      } else if (m_running_status == (NOTE_OFF | MIDI_CH)) {
+        if (!is_data_byte(m_first_data)) {
+          m_first_data = b;
+        } else {
+          note_off(m_first_data);
+          m_first_data = DATA_BYTE_INVALID;
+        }
+      } else if (m_running_status == (CONTROL_CHANGE | MIDI_CH)) {
+        if (!is_data_byte(m_first_data)) {
+          m_first_data = b;
+        } else {
+          control_change(m_first_data, b);
+          m_first_data = DATA_BYTE_INVALID;
+        }
+      }
+    } else if (is_system_message(b)) {
+      switch (b) {
+      case SYSTEM_EXCLUSIVE:
+        m_system_exclusive = true;
+        m_running_status = STATUS_BYTE_INVALID;
+        break;
+      case EOX:
+      case TUNE_REQUEST:
+      case 0xF4:
+      case 0xF5:
+        m_system_exclusive = false;
+        m_system_data_remaining = 0;
+        m_running_status = STATUS_BYTE_INVALID;
+        break;
+      case TIME_CODE:
+      case SONG_SELECT:
+        m_system_exclusive = false;
+        m_system_data_remaining = 1;
+        m_running_status = STATUS_BYTE_INVALID;
+        break;
+      case SONG_POSITION:
+        m_system_exclusive = false;
+        m_system_data_remaining = 2;
+        m_running_status = STATUS_BYTE_INVALID;
+        break;
+      }
+    } else if (is_status_byte(b)) {
+      m_system_exclusive = false;
+      m_running_status = b;
+      m_first_data = DATA_BYTE_INVALID;
+    }
+  }
+
+private:
+  INLINE static boolean is_real_time_message(uint8_t b) {
+    return b >= REAL_TIME_MESSAGE_MIN;
+  }
+
+  INLINE static boolean is_system_message(uint8_t b) {
+    return b >= SYSTEM_MESSAGE_MIN;
+  }
+
+  INLINE static boolean is_status_byte(uint8_t b) {
+    return b >= STATUS_BYTE_MIN;
+  }
+
+  INLINE static boolean is_data_byte(uint8_t b) {
+    return b <= DATA_BYTE_MAX;
+  }
+
+  INLINE static void note_on(uint8_t note_number) {
+    // Stepped mapping to MIDI notes: C, Db, D, Eb, E, F...
+    syncPhaseInc = mapMidi((127 - note_number) << 3);
+  }
+
+  INLINE static void note_off(uint8_t note_number) {
+  }
+
+  INLINE static void control_change(uint8_t controller_number, uint8_t controller_value) {
+    switch (controller_number) {
+    case GRAIN_FREQ_CONTROL:
+      grainPhaseInc  = mapPhaseInc(((127 - controller_value) << 3) + 0) / 2;
+      break;
+    case GRAIN_DECAY_CONTROL:
+      grainDecay     = (((127 - controller_value) << 3) + 0) / 8;
+      break;
+    case GRAIN2_FREQ_CONTROL:
+      grain2PhaseInc = mapPhaseInc(((127 - controller_value) << 3) + 4) / 2;
+      break;
+    case GRAIN2_DECAY_CONTROL:
+      grain2Decay    = (((127 - controller_value) << 3) + 4) / 4;
+      break;
+    default:
+      break;
+    }
+  }
+};
+
+uint8_t MIDI::m_system_exclusive;
+uint8_t MIDI::m_system_data_remaining;
+uint8_t MIDI::m_running_status;
+uint8_t MIDI::m_first_data;
 
 
 // Changing these will also requires rewriting audioOn()
@@ -141,30 +304,31 @@ void audioOn() {
 
 
 void setup() {
+  MIDI::initialize();
+  SerialIn::open();
+
+  syncPhaseInc   = mapMidi((127 - 60) << 3);
+  grainPhaseInc  = mapPhaseInc(((127 - 64) << 3) + 0) / 2;
+  grainDecay     = (((127 - 64) << 3) + 0) / 8;
+  grain2PhaseInc = mapPhaseInc(((127 - 64) << 3) + 4) / 2;
+  grain2Decay    = (((127 - 64) << 3) + 4) / 4;
+
   pinMode(PWM_PIN,OUTPUT);
   audioOn();
   pinMode(LED_PIN,OUTPUT);
 }
 
 void loop() {
-  // The loop is pretty simple - it just updates the parameters for the oscillators.
-  //
-  // Avoid using any functions that make extensive use of interrupts, or turn interrupts off.
-  // They will cause clicks and poops in the audio.
-  
-  // Smooth frequency mapping
-  //syncPhaseInc = mapPhaseInc(analogRead(SYNC_CONTROL)) / 4;
-  
-  // Stepped mapping to MIDI notes: C, Db, D, Eb, E, F...
-  //syncPhaseInc = mapMidi(analogRead(SYNC_CONTROL));
-  
-  // Stepped pentatonic mapping: D, E, G, A, B
-  syncPhaseInc = mapPentatonic(analogRead(SYNC_CONTROL));
-
-  grainPhaseInc  = mapPhaseInc(analogRead(GRAIN_FREQ_CONTROL)) / 2;
-  grainDecay     = analogRead(GRAIN_DECAY_CONTROL) / 8;
-  grain2PhaseInc = mapPhaseInc(analogRead(GRAIN2_FREQ_CONTROL)) / 2;
-  grain2Decay    = analogRead(GRAIN2_DECAY_CONTROL) / 4;
+  while(true) {
+    // The loop is pretty simple - it just updates the parameters for the oscillators.
+    //
+    // Avoid using any functions that make extensive use of interrupts, or turn interrupts off.
+    // They will cause clicks and poops in the audio.
+    if (SerialIn::available()) {
+      uint8_t b = SerialIn::read();
+      MIDI::receive_midi_byte(b);
+    }
+  }
 }
 
 SIGNAL(PWM_INTERRUPT)
